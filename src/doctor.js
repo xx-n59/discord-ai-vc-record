@@ -6,6 +6,7 @@ const config = loadConfig();
 console.log(`Node.js: ${process.version}`);
 console.log(generateDependencyReport());
 for (const key of ['DISCORD_TOKEN', 'DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID']) console.log(`${key}: ${process.env[key]?.trim() ? '設定済み' : '未設定'}`);
+console.log(`議事録の送信先: ${config.outputChannelId ? `専用チャンネル (${config.outputChannelId})` : '録音したVCのチャット'}`);
 for (const [label, check] of [
   ['ChatGPTサブスク認証', () => checkCodexLogin(config)],
   ['ローカル文字起こし', () => runProcess(config.pythonPath, ['-c', `import io, wave

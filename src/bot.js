@@ -7,9 +7,10 @@ import { Recorder } from './recorder.js';
 import { processSession } from './ai.js';
 import { acquireLock } from './lock.js';
 import { mayStart, mayManage } from './commands.js';
+import { resolveOutputChannel, validateOutputChannel } from './output-channel.js';
 
 const noMentions = { parse: [] };
-export function createBot(config) {
+export function createBot(config, { connectVoice = joinVoiceChannel, waitForVoice = entersState, RecorderClass = Recorder, processRecording = processSession } = {}) {
   const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates], allowedMentions: noMentions });
   const active = new Map();
   let shuttingDown = false;
@@ -18,19 +19,19 @@ export function createBot(config) {
   }
   async function publish(entry, result) {
     const files = [result.minutesPath, result.transcriptPath];
-    const limit = entry.channel.guild.maximumFileSize ?? 8 * 1024 * 1024;
+    const limit = entry.outputChannel.guild.maximumFileSize ?? 8 * 1024 * 1024;
     if (files.some(file => fs.statSync(file).size > limit)) {
-      await send(entry.channel, `議事録を保存しました。添付サイズ上限を超えたため、Botの data/${entry.session.id}/ を確認してください。`);
+      await send(entry.outputChannel, `議事録を保存しました。添付サイズ上限を超えたため、Botの data/${entry.session.id}/ を確認してください。`);
       return;
     }
-    await send(entry.channel, `📝 **議事録が完成しました**\n会議: ${entry.session.title}\n録音ID: \`${entry.session.id}\`\nAIの出力を確認してからご利用ください。`, files.map(file => new AttachmentBuilder(file)));
+    await send(entry.outputChannel, `📝 **議事録が完成しました**\n会議: ${entry.session.title}\n録音ID: \`${entry.session.id}\`\nAIの出力を確認してからご利用ください。`, files.map(file => new AttachmentBuilder(file)));
   }
   async function processEntry(entry) {
     let unlock;
     try {
       unlock = acquireLock(path.join(entry.session.dir, '.processing.lock'));
-      await send(entry.channel, `録音を終了しました。PC内で文字起こしを行い、ChatGPTサブスクのCodexで議事録を作成します。\n録音ID: \`${entry.session.id}\`\n処理には時間がかかることがあります。`);
-      const result = await processSession(entry.session, config);
+      await send(entry.outputChannel, `録音を終了しました。PC内で文字起こしを行い、ChatGPTサブスクのCodexで議事録を作成します。\n録音ID: \`${entry.session.id}\`\n処理には時間がかかることがあります。`);
+      const result = await processRecording(entry.session, config);
       await publish(entry, result);
     } catch (error) {
       console.error('議事録処理:', error.message);
@@ -41,7 +42,7 @@ export function createBot(config) {
       const message = entry.session.status === 'complete'
         ? '議事録は保存済みですがDiscordへの投稿に失敗しました。'
         : `議事録の作成を完了できませんでした。${error.message}`;
-      await send(entry.channel, `${message}\n録音ID: \`${entry.session.id}\`\n設定や利用上限を確認し、\`/record retry\` の id に録音IDを指定してください。`).catch(() => {});
+      await send(entry.outputChannel, `${message}\n録音ID: \`${entry.session.id}\`\n設定や利用上限を確認し、\`/record retry\` の id に録音IDを指定してください。`).catch(() => {});
     } finally {
       unlock?.();
       if (active.get(entry.session.guildId) === entry) active.delete(entry.session.guildId);
@@ -66,7 +67,7 @@ export function createBot(config) {
       entry.session.status = 'failed';
       try { saveSession(entry.session); } catch { /* disk may be unavailable */ }
       if (active.get(entry.session.guildId) === entry) active.delete(entry.session.guildId);
-      void send(entry.channel, `録音の終了処理に失敗しました。保存済みデータを確認してください。録音ID: ${entry.session.id}`).catch(() => {});
+      void send(entry.outputChannel, `録音の終了処理に失敗しました。保存済みデータを確認してください。録音ID: ${entry.session.id}`).catch(() => {});
     });
     return entry.stopPromise;
   }
@@ -79,26 +80,28 @@ export function createBot(config) {
     if (active.has(interaction.guildId)) throw new Error('このサーバーでは録音または議事録作成が進行中です。');
     const botMember = await interaction.guild.members.fetchMe();
     const permissions = channel.permissionsFor(botMember);
-    const required = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages, PermissionFlagsBits.AttachFiles];
-    if (!permissions?.has(required)) throw new Error('VCでBotに「チャンネルを見る・接続・メッセージ送信・ファイル添付」の権限を付けてください。');
+    const required = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.SendMessages];
+    if (!permissions?.has(required)) throw new Error('VCでBotに「チャンネルを見る・接続・メッセージ送信」の権限を付けてください。');
+    const outputChannel = await resolveOutputChannel({ guild: interaction.guild, voiceChannel: channel,
+      outputChannelId: config.outputChannelId, member, botMember });
     // Recheck after the permission fetch, then reserve before the next await.
     if (active.has(interaction.guildId)) throw new Error('すでに録音・処理を開始しています。');
     const session = createSession(config, { title: interaction.options.getString('title') || 'VCミーティング',
-      guildId: interaction.guildId, voiceChannelId: channel.id, textChannelId: channel.id, startedBy: member.id });
-    const entry = { session, channel };
+      guildId: interaction.guildId, voiceChannelId: channel.id, textChannelId: outputChannel.id, startedBy: member.id });
+    const entry = { session, channel, outputChannel };
     active.set(interaction.guildId, entry);
     try {
-      await send(channel, `🔴 **録音を開始します**\n会議: ${session.title}\n音声はPC内で文字起こしし、文章をChatGPTのCodexに送信して議事録化します。\n終了: /record stop（開始者またはサーバー管理者）。最大${config.maxMinutes}分。\n議事録・文字起こしはこのVCのチャットに投稿します。`);
-      entry.connection = joinVoiceChannel({ channelId: channel.id, guildId: channel.guild.id,
+      await send(channel, `🔴 **録音を開始します**\n会議: ${session.title}\n音声はPC内で文字起こしし、文章をChatGPTのCodexに送信して議事録化します。\n終了: /record stop（開始者またはサーバー管理者）。最大${config.maxMinutes}分。\n議事録・文字起こしの送信先: <#${outputChannel.id}>。`);
+      entry.connection = connectVoice({ channelId: channel.id, guildId: channel.guild.id,
         adapterCreator: channel.guild.voiceAdapterCreator, selfDeaf: false, selfMute: true });
       entry.connection.on('error', () => {
         if (entry.recorder && !entry.stopPromise) stopEntry(entry, '音声接続エラーにより途中で停止しました。');
       });
-      await entersState(entry.connection, VoiceConnectionStatus.Ready, 30000);
+      await waitForVoice(entry.connection, VoiceConnectionStatus.Ready, 30000);
       if (shuttingDown) throw new Error('Botを終了中です。');
       // Count the meeting from the moment recording actually starts.
       session.startedAt = new Date().toISOString();
-      entry.recorder = new Recorder(entry.connection, session, config, userId => {
+      entry.recorder = new RecorderClass(entry.connection, session, config, userId => {
         const user = channel.guild.members.cache.get(userId);
         return user && { bot: user.user.bot, name: user.displayName };
       }, () => { setImmediate(() => stopEntry(entry, '音声受信または録音容量上限のため自動停止しました。')); });
@@ -114,7 +117,7 @@ export function createBot(config) {
       await send(channel, '録音を開始できませんでした。Botの権限・VC接続を確認してください。').catch(() => {});
       throw error;
     }
-    await interaction.editReply(`録音中です。結果は <#${channel.id}> のチャットに届きます。\n録音ID: \`${session.id}\``);
+    await interaction.editReply(`録音中です。結果は <#${outputChannel.id}> に届きます。\n録音ID: \`${session.id}\``);
   }
   client.on(Events.InteractionCreate, async interaction => {
     if (!interaction.isChatInputCommand() || interaction.commandName !== 'record') return;
@@ -133,7 +136,7 @@ export function createBot(config) {
         if (!entry?.recorder || entry.stopPromise) throw new Error('停止できる録音がありません。');
         if (!mayManage(member, entry.session)) throw new Error('録音開始者またはサーバー管理者だけが停止できます。');
         stopEntry(entry);
-        await interaction.editReply('録音を終了して議事録を作成します。完成後、VCのチャットに投稿します。');
+        await interaction.editReply(`録音を終了して議事録を作成します。完成後、<#${entry.session.textChannelId}> に投稿します。`);
         return;
       }
       if (action === 'retry') {
@@ -141,10 +144,13 @@ export function createBot(config) {
         const session = loadSession(config.dataDir, interaction.options.getString('id'));
         if (session.guildId !== interaction.guildId || !mayManage(member, session)) throw new Error('この録音の再実行権限がありません。');
         const channel = await interaction.guild.channels.fetch(session.textChannelId);
-        if (!channel?.isTextBased() || !channel.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) throw new Error('元のVCチャットにアクセスできません。');
+        const botMember = await interaction.guild.members.fetchMe();
+        validateOutputChannel(channel, { guildId: interaction.guildId, voiceChannelId: session.voiceChannelId, member, botMember });
+        const voiceChannel = session.voiceChannelId === channel.id ? channel : await interaction.guild.channels.fetch(session.voiceChannelId);
+        if (!voiceChannel?.permissionsFor(member)?.has(PermissionFlagsBits.ViewChannel)) throw new Error('元のVCにアクセスできません。');
         if (active.has(interaction.guildId)) throw new Error('現在の処理が終了してから再実行してください。');
         if (session.status === 'recording' || session.status === 'stopping') throw new Error('録音中です。Botを停止してから再実行してください。');
-        const retryEntry = { session, channel };
+        const retryEntry = { session, outputChannel: channel };
         active.set(interaction.guildId, retryEntry);
         void processEntry(retryEntry);
         await interaction.editReply(`再処理を開始しました。結果は <#${channel.id}> に投稿します。`);
@@ -163,7 +169,7 @@ export function createBot(config) {
       stopEntry(entry, 'Botの移動・退出・スピーカーミュートにより自動停止しました。'); return;
     }
     if (after.channelId === entry.channel.id && before.channelId !== after.channelId && !after.member?.user.bot) {
-      void send(entry.channel, '🔴 このVCは録音中です。PC内で文字起こし後、文章をCodexに送信して議事録を作ります。').catch(() => {});
+      void send(entry.channel, `🔴 このVCは録音中です。PC内で文字起こし後、文章をCodexに送信して議事録を作ります。送信先: <#${entry.session.textChannelId}>。`).catch(() => {});
     }
     if (!entry.channel.members.some(member => !member.user.bot)) stopEntry(entry, '参加者が全員退出したため自動停止しました。');
   });

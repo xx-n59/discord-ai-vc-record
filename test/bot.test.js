@@ -48,7 +48,7 @@ test('two simultaneous stop commands finalize the recording only once', async t 
   bot.active.set('guild', { session,
     recorder: { stop: async () => { stops++; await gate; } },
     connection: { destroy: () => { destroys++; } },
-    channel: { send: async () => {} },
+    outputChannel: { send: async () => {} },
   });
   const a = interaction('owner', 'stop'); const b = interaction('owner', 'stop');
   bot.client.emit(Events.InteractionCreate, a); bot.client.emit(Events.InteractionCreate, b);

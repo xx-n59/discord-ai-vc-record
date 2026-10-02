@@ -12,7 +12,7 @@ export function loadConfig(env = process.env, { required = [] } = {}) {
     }
     return value;
   };
-  for (const key of ['DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID', 'ALLOWED_ROLE_ID']) {
+  for (const key of ['DISCORD_CLIENT_ID', 'DISCORD_GUILD_ID', 'DISCORD_OUTPUT_CHANNEL_ID', 'ALLOWED_ROLE_ID']) {
     if (env[key]?.trim() && !/^\d{17,20}$/.test(env[key].trim())) {
       throw new Error(`${key} はDiscordのIDを指定してください。`);
     }
@@ -20,6 +20,7 @@ export function loadConfig(env = process.env, { required = [] } = {}) {
   return {
     token: env.DISCORD_TOKEN?.trim(), clientId: env.DISCORD_CLIENT_ID?.trim(),
     guildId: env.DISCORD_GUILD_ID?.trim(),
+    outputChannelId: env.DISCORD_OUTPUT_CHANNEL_ID?.trim(),
     dataDir: path.resolve(env.DATA_DIR || './data'),
     whisperModel: env.WHISPER_MODEL || 'small',
     pythonPath: env.PYTHON_PATH || path.resolve('.venv/bin/python'),
